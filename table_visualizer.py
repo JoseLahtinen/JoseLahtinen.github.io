@@ -10,6 +10,9 @@ from urllib3.util.retry import Retry
 from collections import deque
 from time import time
 import time as time_module
+import io
+from PIL import Image
+import math
 
 # Statistics Finland API Limits
 SF_API_LIMITS = {
@@ -21,37 +24,30 @@ SF_API_LIMITS = {
 }
 
 class RateLimiter:
-    """Rate limiter to enforce max calls per time window."""
+    """Simple rate limiter that tracks call timestamps."""
     def __init__(self, max_calls: int, time_window: int):
         self.max_calls = max_calls
         self.time_window = time_window
         self.call_times = deque()
-    
+
     def is_allowed(self) -> bool:
-        """Check if a call is allowed within the rate limit."""
         now = time()
-        # Remove calls outside the time window
         while self.call_times and self.call_times[0] < now - self.time_window:
             self.call_times.popleft()
-        # Check if we can make another call
         return len(self.call_times) < self.max_calls
-    
+
     def record_call(self):
-        """Record a new API call."""
         self.call_times.append(time())
-    
+
     def wait_if_needed(self):
-        """Wait if rate limit is about to be exceeded."""
         while not self.is_allowed():
             oldest = self.call_times[0] if self.call_times else time()
             sleep_time = (oldest + self.time_window) - time()
             if sleep_time > 0:
                 time_module.sleep(min(sleep_time + 0.1, 1.0))
-    
+
     def get_remaining_calls(self) -> int:
-        """Get remaining calls available in current window."""
         now = time()
-        # Remove calls outside the time window
         while self.call_times and self.call_times[0] < now - self.time_window:
             self.call_times.popleft()
         return max(0, self.max_calls - len(self.call_times))
@@ -628,6 +624,146 @@ if df is not None and not df.empty:
         all_columns = filtered_df.columns.tolist()
 
         with chart_controls:
+            # Presets
+            presets = ['None', 'Time Series', 'Comparison (grouped)', 'Distribution Dashboard']
+            preset = st.selectbox("Preset:", options=presets, index=0)
+
+            # Time-series detection
+            detected_time_col = None
+            if preset == 'Time Series':
+                # Try to auto-detect a time column
+                for c in all_columns:
+                    if pd.api.types.is_datetime64_any_dtype(filtered_df[c]):
+                        detected_time_col = c
+                        break
+                if detected_time_col is None:
+                    # try parseable object columns
+                    for c in all_columns:
+                        if filtered_df[c].dtype == object:
+                            try:
+                                parsed = pd.to_datetime(filtered_df[c], errors='coerce')
+                                if parsed.notna().sum() > 0:
+                                    detected_time_col = c
+                                    break
+                            except Exception:
+                                continue
+
+                if detected_time_col:
+                    st.markdown(f"Detected time column: **{detected_time_col}**")
+                    use_time = st.checkbox("Use detected time column", value=True)
+                    if use_time:
+                        x_col = detected_time_col
+                        # convert in-place for plotting
+                        try:
+                            filtered_df[x_col] = pd.to_datetime(filtered_df[x_col], errors='coerce')
+                        except Exception:
+                            pass
+
+                    # Resampling options
+                    resample_map = {'Daily':'D','Weekly':'W','Monthly':'M','Quarterly':'Q','Yearly':'Y'}
+                    resample_label = st.selectbox('Resample frequency:', options=list(resample_map.keys()), index=2)
+                    resample_freq = resample_map[resample_label]
+                else:
+                    st.info('No time-like column detected; pick X column manually.')
+
+            # Dashboard templates (pre-made, one-click apply)
+            dashboard_templates = {
+                'None': [],
+                'Tourism Overview': [
+                    {'graph_type':'Line','x':'Year','y':'Value','title':'Visitors over time'},
+                    {'graph_type':'Bar','x':'Region','y':'Value','agg':'sum','title':'Visitors by region'},
+                    {'graph_type':'Pie','x':'Purpose','title':'Visit purpose share'}
+                ],
+                'Accommodation Summary': [
+                    {'graph_type':'Line','x':'Year','y':'Nights','title':'Nights stayed (time series)'},
+                    {'graph_type':'Bar','x':'AccommodationType','y':'Nights','agg':'sum','title':'Nights by accommodation type'},
+                    {'graph_type':'Box','x':'Region','y':'Nights','title':'Nights distribution by region'}
+                ],
+                'Air Transport Snapshot': [
+                    {'graph_type':'Line','x':'Year','y':'Passengers','title':'Air passengers over time'},
+                    {'graph_type':'Bar','x':'Airport','y':'Passengers','agg':'sum','title':'Passengers by airport'},
+                    {'graph_type':'Histogram','x':'DelayMinutes','title':'Delay distribution'}
+                ],
+                'Population Trends': [
+                    {'graph_type':'Line','x':'Year','y':'Population','title':'Population over time'},
+                    {'graph_type':'Bar','x':'AgeGroup','y':'Population','agg':'sum','title':'Population by age group'}
+                ]
+            }
+
+            if preset != 'None':
+                st.markdown(f"Preset layout: **{preset}**")
+
+            def apply_dashboard_template(template_name, source_df):
+                """Apply a preset template by building the listed charts from source_df
+                and storing them in `st.session_state['dashboard_figs']` as serializable specs.
+                """
+                specs = dashboard_templates.get(template_name) or []
+                if not specs:
+                    return False, 'No specs for template'
+
+                st.session_state['dashboard_figs'] = []
+                for s in specs:
+                    try:
+                        gt = s.get('graph_type')
+                        title = s.get('title') or f"{gt}"
+                        x = s.get('x')
+                        y = s.get('y')
+                        agg = s.get('agg')
+                        # Skip if required columns are missing
+                        if x and x not in source_df.columns:
+                            continue
+                        if y and y not in source_df.columns:
+                            continue
+
+                        if gt == 'Line':
+                            f = px.line(source_df, x=x, y=y, title=title)
+                        elif gt == 'Bar':
+                            if agg and y:
+                                g = source_df.groupby(x)[y].agg(agg).reset_index()
+                                f = px.bar(g, x=x, y=y, title=title)
+                            else:
+                                f = px.bar(source_df, x=x, y=y, title=title)
+                        elif gt == 'Histogram':
+                            f = px.histogram(source_df, x=x, title=title)
+                        elif gt == 'Box':
+                            f = px.box(source_df, x=x, y=y, title=title)
+                        elif gt == 'Pie':
+                            if y:
+                                g = source_df.groupby(x)[y].sum().reset_index()
+                                f = px.pie(g, names=x, values=y, title=title)
+                            else:
+                                g = source_df[x].value_counts().reset_index()
+                                g.columns = [x, 'count']
+                                f = px.pie(g, names=x, values='count', title=title)
+                        else:
+                            f = px.histogram(source_df, x=x, title=title)
+
+                        st.session_state['dashboard_figs'].append({'title': title, 'fig': f, 'spec': s})
+                    except Exception:
+                        continue
+                return True, f'Applied {len(st.session_state.get("dashboard_figs", []))} charts'
+
+            # Template gallery UI: choose and apply a pre-made dashboard
+            template_choice = st.selectbox('Dashboard template:', options=list(dashboard_templates.keys()), index=0)
+            if template_choice and template_choice != 'None':
+                st.markdown(f"**Selected template:** {template_choice}")
+                if st.button('Apply template', key='apply_template'):
+                    ok, msg = apply_dashboard_template(template_choice, filtered_df)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.info(msg)
+
+            # Aggregation heuristic for bars
+            def suggest_agg(col_name, series):
+                name = str(col_name).lower()
+                if any(k in name for k in ['count', 'number', 'total', 'sum']):
+                    return 'sum'
+                if pd.api.types.is_integer_dtype(series):
+                    return 'sum'
+                if pd.api.types.is_float_dtype(series):
+                    return 'mean'
+                return 'count'
             graph_type = st.selectbox("Graph type:", options=[
                 'Scatter', 'Line', 'Bar', 'Histogram', 'Box', 'Pie', 'Heatmap'
             ], index=0)
@@ -691,6 +827,121 @@ if df is not None and not df.empty:
                     if log_scale and hasattr(fig, 'update_yaxes'):
                         fig.update_yaxes(type='log')
                     st.plotly_chart(fig, use_container_width=True)
+
+                    # Enhanced export & dashboard options
+                    exp_col1, exp_col2 = st.columns([1,1])
+
+                    # Initialize dashboard storage
+                    if 'dashboard_figs' not in st.session_state:
+                        st.session_state['dashboard_figs'] = []
+
+                    # Add to dashboard
+                    add_key = f"add_dashboard_{len(st.session_state['dashboard_figs'])}"
+                    if exp_col1.button('Add chart to dashboard', key=add_key):
+                        # store minimal serializable data: title + figure (Plotly fig is serializable)
+                        st.session_state['dashboard_figs'].append({'title': chart_title, 'fig': fig})
+                        st.success('Chart added to dashboard')
+
+                    # Single-chart exports
+                    with exp_col2:
+                        try:
+                            if st.button('Download PNG (chart)', key=f"png_chart_{len(st.session_state['dashboard_figs'])}"):
+                                img_bytes = fig.to_image(format='png')
+                                st.download_button('Save PNG', data=img_bytes, file_name='chart.png', mime='image/png')
+                        except Exception:
+                            st.warning('PNG export for single chart requires the `kaleido` package.')
+
+                        html = fig.to_html(full_html=False, include_plotlyjs='cdn')
+                        if st.button('Download HTML Embed', key=f"html_chart_{len(st.session_state['dashboard_figs'])}"):
+                            st.download_button('Save HTML', data=html, file_name='chart_embed.html', mime='text/html')
+                        st.markdown('**Embed snippet:**')
+                        st.code(html, language='html')
+
+                    # Dashboard manager
+                    if st.session_state.get('dashboard_figs'):
+                        with st.expander('Dashboard (' + str(len(st.session_state['dashboard_figs'])) + ' charts)'):
+                            for i, item in enumerate(st.session_state['dashboard_figs']):
+                                st.write(f"{i+1}. {item['title']}")
+
+                            if st.button('Clear dashboard', key='clear_dashboard'):
+                                st.session_state['dashboard_figs'] = []
+                                st.experimental_rerun()
+
+                            # Export dashboard as HTML or PNG; also save/load templates
+                            parts = [d['fig'].to_html(full_html=False, include_plotlyjs='cdn') for d in st.session_state['dashboard_figs']]
+                            full_html = "<html><head><meta charset='utf-8'></head><body>" + "<hr/>".join(parts) + "</body></html>"
+                            if st.button('Download dashboard HTML', key='export_dashboard_html'):
+                                st.download_button('Download dashboard HTML', data=full_html, file_name='dashboard.html', mime='text/html')
+
+                            # Template load/save
+                            uploaded = st.file_uploader('Load dashboard template (JSON)', type=['json'])
+                            if uploaded is not None:
+                                try:
+                                    j = json.load(uploaded)
+                                    st.session_state['dashboard_figs'] = []
+                                    for s in j:
+                                        gt = s.get('graph_type')
+                                        try:
+                                            if gt == 'Line':
+                                                f = px.line(filtered_df, x=s.get('x'), y=s.get('y'), title=s.get('title'))
+                                            elif gt == 'Histogram':
+                                                f = px.histogram(filtered_df, x=s.get('x'), title=s.get('title'))
+                                            elif gt == 'Bar':
+                                                if s.get('agg') and s.get('y'):
+                                                    g = filtered_df.groupby(s.get('x'))[s.get('y')].agg(s.get('agg')).reset_index()
+                                                    f = px.bar(g, x=s.get('x'), y=s.get('y'), title=s.get('title'))
+                                                else:
+                                                    f = px.bar(filtered_df, x=s.get('x'), y=s.get('y'), title=s.get('title'))
+                                            elif gt == 'Box':
+                                                f = px.box(filtered_df, x=s.get('x'), y=s.get('y'), title=s.get('title'))
+                                            else:
+                                                f = px.histogram(filtered_df, x=s.get('x'), title=s.get('title'))
+                                        except Exception:
+                                            continue
+                                        st.session_state['dashboard_figs'].append({'title': s.get('title'), 'fig': f, 'spec': s})
+                                    st.success('Template loaded')
+                                except Exception as e:
+                                    st.error(f'Failed to load template: {e}')
+
+                            if st.button('Save dashboard as template (JSON)', key='save_template'):
+                                specs = [d.get('spec') for d in st.session_state['dashboard_figs'] if d.get('spec')]
+                                if specs:
+                                    st.download_button('Download template', data=json.dumps(specs, indent=2), file_name='dashboard_template.json', mime='application/json')
+                                else:
+                                    st.info('No specs available to save')
+
+                            # Grid layout options for stitched PNG
+                            cols = st.number_input('Grid columns for PNG export', min_value=1, max_value=6, value=1)
+                            if st.button('Export dashboard as PNG', key='export_dashboard_png'):
+                                pngs = []
+                                failed = False
+                                for d in st.session_state['dashboard_figs']:
+                                    try:
+                                        b = d['fig'].to_image(format='png')
+                                        pngs.append(Image.open(io.BytesIO(b)))
+                                    except Exception:
+                                        failed = True
+                                        break
+
+                                if failed or not pngs:
+                                    st.warning('PNG export of full dashboard requires `kaleido` and `Pillow`.')
+                                else:
+                                    n = len(pngs)
+                                    grid_cols = int(cols)
+                                    grid_rows = math.ceil(n / grid_cols)
+                                    maxw = max(im.width for im in pngs)
+                                    maxh = max(im.height for im in pngs)
+                                    dst = Image.new('RGBA', (grid_cols * maxw, grid_rows * maxh), (255,255,255,255))
+                                    for idx, im in enumerate(pngs):
+                                        row = idx // grid_cols
+                                        col = idx % grid_cols
+                                        x = col * maxw + (maxw - im.width) // 2
+                                        y = row * maxh + (maxh - im.height) // 2
+                                        dst.paste(im, (x, y))
+                                    buf = io.BytesIO()
+                                    dst.convert('RGB').save(buf, format='PNG')
+                                    buf.seek(0)
+                                    st.download_button('Download dashboard PNG', data=buf, file_name='dashboard.png', mime='image/png')
                 else:
                     st.info("Unable to build chart with the selected options.")
             except Exception as e:
