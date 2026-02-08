@@ -7,6 +7,57 @@ import json
 from typing import Dict, List, Optional
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from collections import deque
+from time import time
+import time as time_module
+
+# Statistics Finland API Limits
+SF_API_LIMITS = {
+    "maxValues": 120000,
+    "maxCells": 120000,
+    "maxCalls": 40,
+    "timeWindow": 60,  # seconds
+    "CORS": True
+}
+
+class RateLimiter:
+    """Rate limiter to enforce max calls per time window."""
+    def __init__(self, max_calls: int, time_window: int):
+        self.max_calls = max_calls
+        self.time_window = time_window
+        self.call_times = deque()
+    
+    def is_allowed(self) -> bool:
+        """Check if a call is allowed within the rate limit."""
+        now = time()
+        # Remove calls outside the time window
+        while self.call_times and self.call_times[0] < now - self.time_window:
+            self.call_times.popleft()
+        # Check if we can make another call
+        return len(self.call_times) < self.max_calls
+    
+    def record_call(self):
+        """Record a new API call."""
+        self.call_times.append(time())
+    
+    def wait_if_needed(self):
+        """Wait if rate limit is about to be exceeded."""
+        while not self.is_allowed():
+            oldest = self.call_times[0] if self.call_times else time()
+            sleep_time = (oldest + self.time_window) - time()
+            if sleep_time > 0:
+                time_module.sleep(min(sleep_time + 0.1, 1.0))
+    
+    def get_remaining_calls(self) -> int:
+        """Get remaining calls available in current window."""
+        now = time()
+        # Remove calls outside the time window
+        while self.call_times and self.call_times[0] < now - self.time_window:
+            self.call_times.popleft()
+        return max(0, self.max_calls - len(self.call_times))
+
+# Global rate limiter instance
+sf_rate_limiter = RateLimiter(SF_API_LIMITS["maxCalls"], SF_API_LIMITS["timeWindow"])
 
 # Page configuration
 st.set_page_config(
@@ -25,12 +76,13 @@ def fetch_stat_fin_databases() -> Dict:
     """Fetch available databases from Statistics Finland API"""
     try:
         with st.spinner("Loading Statistics Finland databases..."):
-            # use a session with retry to handle transient 429/5xx responses
+            sf_rate_limiter.wait_if_needed()
             session = requests.Session()
             retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             response = session.get(SF_API_BASE, timeout=10)
             response.raise_for_status()
+            sf_rate_limiter.record_call()
             return response.json()
     except Exception as e:
         st.error(f"Error fetching databases: {e}")
@@ -41,11 +93,13 @@ def fetch_stat_fin_tables(db_id: str) -> Dict:
     """Fetch available tables from a Statistics Finland database"""
     try:
         url = f"{SF_API_BASE}/{db_id}"
+        sf_rate_limiter.wait_if_needed()
         session = requests.Session()
         retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
         session.mount('https://', HTTPAdapter(max_retries=retries))
         response = session.get(url, timeout=10)
         response.raise_for_status()
+        sf_rate_limiter.record_call()
         return response.json()
     except Exception as e:
         st.error(f"Error fetching tables: {e}")
@@ -57,11 +111,13 @@ def fetch_stat_fin_table_metadata(db_id: str, table_id: str) -> Dict:
     """Fetch table metadata (variables and categories) from Statistics Finland"""
     try:
         url = f"{SF_API_BASE}/{db_id}/{table_id}"
+        sf_rate_limiter.wait_if_needed()
         session = requests.Session()
         retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
         session.mount('https://', HTTPAdapter(max_retries=retries))
         response = session.get(url, timeout=10)
         response.raise_for_status()
+        sf_rate_limiter.record_call()
         return response.json()
     except Exception as e:
         st.error(f"Error fetching table metadata: {e}")
@@ -69,11 +125,30 @@ def fetch_stat_fin_table_metadata(db_id: str, table_id: str) -> Dict:
 
 
 @st.cache_data(ttl=3600)
-def fetch_stat_fin_table_data_with_query(db_id: str, table_id: str, query: Dict) -> Optional[pd.DataFrame]:
-    """Fetch table data using a prepared PXWeb query dict"""
+def fetch_stat_fin_table_data_with_query(db_id: str, table_id: str, variable_selections: Dict[str, List[str]]) -> Optional[pd.DataFrame]:
+    """Fetch table data using variable selections. Builds correct PXWeb JSON query format."""
     try:
         with st.spinner("Loading data..."):
+            sf_rate_limiter.wait_if_needed()
             data_url = f"{SF_API_BASE}/{db_id}/{table_id}"
+            
+            # Build correct PXWeb query format
+            query_list = []
+            for code, values in variable_selections.items():
+                if values:  # Only include non-empty selections
+                    query_list.append({
+                        "code": code,
+                        "selection": {
+                            "filter": "item",
+                            "values": values
+                        }
+                    })
+            
+            query = {
+                "query": query_list,
+                "response": {"format": "json"}
+            }
+            
             headers = {"Content-Type": "application/json"}
             session = requests.Session()
             retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
@@ -85,10 +160,11 @@ def fetch_stat_fin_table_data_with_query(db_id: str, table_id: str, query: Dict)
                 timeout=30
             )
             data_response.raise_for_status()
+            sf_rate_limiter.record_call()
             data = data_response.json()
 
-            if "data" in data and "dimension" in data:
-                return parse_pxweb_data(data)
+            if "data" in data:
+                return parse_pxweb_json_data(data)
             else:
                 st.warning("No data returned for that query")
                 return None
@@ -107,16 +183,30 @@ def estimate_query_size(variable_selections: Dict[str, List[str]]) -> int:
     return size
 
 
+def validate_query_size(variable_selections: Dict[str, List[str]]) -> tuple[bool, str]:
+    """Validate query against API limits. Returns (is_valid, message)."""
+    size = estimate_query_size(variable_selections)
+    max_cells = SF_API_LIMITS["maxCells"]
+    
+    if size > max_cells:
+        return False, f"Query size ({size} cells) exceeds API limit ({max_cells} cells). Please reduce selections."
+    return True, f"Query size: {size} cells (limit: {max_cells})"
+
+
 def chunked_fetch(db_id: str, table_id: str, variable_selections: Dict[str, List[str]], max_chunk_cells: int = 2000) -> Optional[pd.DataFrame]:
-    """Fetch data by splitting the largest variable into batches so each request stays under max_chunk_cells."""
+    """Fetch data by splitting the largest variable into batches so each request stays under max_chunk_cells and API limits."""
     # Determine sizes
     sizes = {k: len(v) if v else 1 for k, v in variable_selections.items()}
     if not sizes:
-        return fetch_stat_fin_table_data_with_query(db_id, table_id, {"response": {"format": "json"}})
+        return fetch_stat_fin_table_data_with_query(db_id, table_id, {})
 
     # Choose split variable as the one with largest cardinality
     split_var = max(sizes.items(), key=lambda x: x[1])[0]
     total = estimate_query_size(variable_selections)
+
+    # Ensure chunk size respects API limits (120k cells)
+    api_max_cells = SF_API_LIMITS["maxCells"]
+    max_chunk_cells = min(max_chunk_cells, api_max_cells)
 
     # compute batch size for split_var
     other_product = max(1, total // sizes[split_var])
@@ -129,20 +219,26 @@ def chunked_fetch(db_id: str, table_id: str, variable_selections: Dict[str, List
 
     dfs = []
     progress = st.progress(0)
+    status_text = st.empty()
     try:
-        for i in range(0, len(values), chunk_len):
-            batch_vals = values[i:i+chunk_len]
-            q = {"response": {"format": "json"}}
-            for code, sel in variable_selections.items():
-                if code == split_var:
-                    q[code] = batch_vals
-                else:
-                    q[code] = sel
-            df_part = fetch_stat_fin_table_data_with_query(db_id, table_id, q)
+        num_chunks = (len(values) + chunk_len - 1) // chunk_len
+        for i, chunk_idx in enumerate(range(0, len(values), chunk_len)):
+            batch_vals = values[chunk_idx:chunk_idx+chunk_len]
+            
+            # Build variable selections for this chunk
+            chunk_selections = dict(variable_selections)
+            chunk_selections[split_var] = batch_vals
+            
+            # Show status
+            status_text.text(f"Loading chunk {i+1}/{num_chunks}...")
+            
+            df_part = fetch_stat_fin_table_data_with_query(db_id, table_id, chunk_selections)
             if df_part is not None and not df_part.empty:
                 dfs.append(df_part)
-            progress.progress(min(1.0, (i+chunk_len) / len(values)))
+            progress.progress(min(1.0, (i+1) / num_chunks))
+        
         progress.empty()
+        status_text.empty()
         if dfs:
             return pd.concat(dfs, ignore_index=True)
         return None
@@ -161,37 +257,15 @@ def fetch_stat_fin_table_data(db_id: str, table_id: str) -> Optional[pd.DataFram
             metadata_response.raise_for_status()
             metadata = metadata_response.json()
             
-            # Prepare the query - get first variable selection for each dimension
-            query = {
-                "response": {
-                    "format": "json"
-                }
-            }
-            
-            # Add variable selections (default: first value for each variable)
+            # Build variable selections - use first value for each variable
+            variable_selections = {}
             if "variables" in metadata:
                 for var in metadata["variables"]:
                     if var.get("values"):
-                        query[var["code"]] = [var["values"][0]]
+                        variable_selections[var["code"]] = [var["values"][0]]
             
-            # Request data with the query
-            data_url = f"{SF_API_BASE}/{db_id}/{table_id}"
-            headers = {"Content-Type": "application/json"}
-            data_response = requests.post(
-                data_url, 
-                json=query, 
-                headers=headers,
-                timeout=15
-            )
-            data_response.raise_for_status()
-            data = data_response.json()
-            
-            # Convert PXWeb response to DataFrame
-            if "data" in data and "dimension" in data:
-                return parse_pxweb_data(data)
-            else:
-                st.warning("No data format available")
-                return None
+            # Request data using the correct PXWeb format
+            return fetch_stat_fin_table_data_with_query(db_id, table_id, variable_selections)
                 
     except Exception as e:
         st.error(f"Error fetching table data: {e}")
@@ -232,6 +306,47 @@ def parse_pxweb_data(pxweb_response: Dict) -> pd.DataFrame:
         st.error(f"Error parsing data: {e}")
         return pd.DataFrame()
 
+def parse_pxweb_json_data(pxweb_response: Dict) -> pd.DataFrame:
+    """Parse PXWeb API JSON format response into a pandas DataFrame"""
+    try:
+        data_values = pxweb_response.get("data", [])
+        columns_info = pxweb_response.get("columns", [])
+        
+        if not columns_info or not data_values:
+            return pd.DataFrame()
+        
+        # Get column codes (dimension names)
+        column_codes = [col.get("code") for col in columns_info]
+        column_texts = [col.get("text") for col in columns_info]
+        
+        rows = []
+        for item in data_values:
+            row = {}
+            
+            # item["key"] contains the dimension values as a list of strings
+            key_parts = item.get("key", [])
+            data_vals = item.get("values", [])
+            
+            # Map key values to column names
+            for i, key_val in enumerate(key_parts):
+                if i < len(column_codes):
+                    col_name = column_texts[i] if i < len(column_texts) else f"Column_{i}"
+                    row[col_name] = key_val
+            
+            # Add the data values
+            # The last column in the response is typically the content/value column
+            if data_vals:
+                row["Value"] = data_vals[0]
+            
+            rows.append(row)
+        
+        return pd.DataFrame(rows)
+    except Exception as e:
+        print(f"Error parsing data: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
 # Title
 st.title("📊 Table Data Visualizer")
 st.markdown("Interactive table data visualization and analysis tool")
@@ -242,6 +357,18 @@ data_source = st.sidebar.radio(
     "Select data source:",
     ["Sample Data", "Upload CSV", "Manual Input", "Statistics Finland"]
 )
+
+# Display API limits in sidebar
+if data_source == "Statistics Finland":
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("### 🇫🇮 Statistics Finland API Limits")
+        st.info(f"""
+- **Max cells per query:** {SF_API_LIMITS["maxCells"]:,}
+- **Max values per query:** {SF_API_LIMITS["maxValues"]:,}
+- **Max API calls:** {SF_API_LIMITS["maxCalls"]} per {SF_API_LIMITS["timeWindow"]}s
+- **CORS enabled:** {'Yes' if SF_API_LIMITS["CORS"] else 'No'}
+        """)
 
 # Initialize dataframe
 df = None
@@ -306,11 +433,11 @@ elif data_source == "Statistics Finland":
             # Fetch tables from selected database
             tables = fetch_stat_fin_tables(selected_db_id)
             
-            if tables:
+            if tables and isinstance(tables, list):
                 # Create a mapping of table names to IDs
                 table_dict = {}
                 for item in tables:
-                    if item.get("type") == "l":
+                    if item.get("type") == "t":  # 't' = table, 'l' = folder/link
                         # Use text as display name, id for requests
                         table_dict[item["text"]] = item["id"]
                 
@@ -363,11 +490,21 @@ elif data_source == "Statistics Finland":
 
                         # Now provide preview and size/ chunking controls
                         estimated_cells = estimate_query_size(variable_selections)
-                        st.write(f"Estimated result size: **{estimated_cells}** cells")
-                        large_threshold = 5000
+                        is_valid, size_msg = validate_query_size(variable_selections)
+                        
+                        # Display size validation
+                        if not is_valid:
+                            st.error(size_msg)
+                        else:
+                            st.info(size_msg)
+                        
+                        # Show rate limit status
+                        remaining_calls = sf_rate_limiter.get_remaining_calls()
+                        st.write(f"API calls remaining (60s window): **{remaining_calls}/{SF_API_LIMITS['maxCalls']}**")
+                        
+                        large_threshold = SF_API_LIMITS["maxCells"] // 4  # Warn at 1/4 of max
                         if estimated_cells > large_threshold:
-                            st.warning("This query is large and may take a long time or be rate-limited. Consider loading a preview or using chunked loading.")
-
+                            st.warning("This query is large. Consider loading a preview or using chunked loading.")
                         # Chunked loading options
                         chunk_opts = st.expander("Chunked loading options (advanced)")
                         with chunk_opts:
@@ -376,31 +513,28 @@ elif data_source == "Statistics Finland":
 
                         # Preview button: fetch a tiny preview using first value of each variable
                         if st.button("Load Preview (small)", key="load_preview"):
-                            preview_query = {"response": {"format": "json"}}
-                            for code, vals in variable_selections.items():
-                                if vals:
-                                    preview_query[code] = [vals[0]]
-                            preview_df = fetch_stat_fin_table_data_with_query(selected_db_id, selected_table_id, preview_query)
+                            preview_selections = {code: [vals[0]] for code, vals in variable_selections.items() if vals}
+                            preview_df = fetch_stat_fin_table_data_with_query(selected_db_id, selected_table_id, preview_selections)
                             if preview_df is not None:
                                 st.dataframe(preview_df.head(100))
 
                         # Build and run the full query when requested
                         if st.button("Load Data", key="load_sf_data"):
-                            query: Dict = {"response": {"format": "json"}}
-                            for code, selected_vals in variable_selections.items():
-                                if selected_vals:
-                                    query[code] = selected_vals
-
-                            if not variable_selections:
+                            if not is_valid:
+                                st.error("Cannot load data: query exceeds API cell limit. Please reduce your selections.")
+                            elif not variable_selections:
                                 st.info("No variable selections available for this table. Attempting to load default data.")
-                                df = fetch_stat_fin_table_data_with_query(selected_db_id, selected_table_id, {"response": {"format": "json"}})
+                                df = fetch_stat_fin_table_data_with_query(selected_db_id, selected_table_id, {})
                             else:
                                 # If estimated size is big and chunked loading enabled, use chunked_fetch
                                 if estimated_cells > large_threshold and enable_chunked:
                                     st.info("Loading data in chunks...")
                                     df = chunked_fetch(selected_db_id, selected_table_id, variable_selections, max_chunk_cells=int(max_chunk_cells))
                                 else:
-                                    df = fetch_stat_fin_table_data_with_query(selected_db_id, selected_table_id, query)
+                                    df = fetch_stat_fin_table_data_with_query(selected_db_id, selected_table_id, variable_selections)
+                elif tables:
+                    st.warning(f"Database has {len(tables)} items but no tables (type='t'). These may be folders or invalid entries.")
+                    st.info(f"Response types found: {set(item.get('type') for item in tables)}")
                 else:
                     st.info("No tables available in this database")
             else:
