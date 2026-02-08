@@ -617,29 +617,84 @@ if df is not None and not df.empty:
             st.write(filtered_df.describe())
     
     # Charts
-    if show_chart and len(numeric_cols) > 0:
+    if show_chart:
         st.subheader("Visualization")
-        
-        chart_col1, chart_col2 = st.columns(2)
-        
-        # Get numeric columns for charting
+
+        chart_controls, chart_preview = st.columns([1, 2])
+
+        # Detect column types
         numeric_columns = filtered_df.select_dtypes(include=['number']).columns.tolist()
-        categorical_columns = filtered_df.select_dtypes(include=['object']).columns.tolist()
-        
-        if numeric_columns:
-            with chart_col1:
-                x_col = st.selectbox("X-axis:", options=filtered_df.columns, index=0, key="x_axis")
-                y_col = st.selectbox("Y-axis:", options=numeric_columns, key="y_axis")
-                
-                if x_col and y_col:
-                    fig = px.scatter(filtered_df, x=x_col, y=y_col, title=f"{y_col} vs {x_col}")
+        categorical_columns = filtered_df.select_dtypes(include=['object', 'category']).columns.tolist()
+        all_columns = filtered_df.columns.tolist()
+
+        with chart_controls:
+            graph_type = st.selectbox("Graph type:", options=[
+                'Scatter', 'Line', 'Bar', 'Histogram', 'Box', 'Pie', 'Heatmap'
+            ], index=0)
+
+            x_col = st.selectbox("X column:", options=all_columns, index=0)
+            # Y only meaningful for most charts
+            y_col = None
+            if graph_type in ['Scatter', 'Line', 'Bar', 'Box']:
+                y_candidates = numeric_columns if numeric_columns else all_columns
+                y_col = st.selectbox("Y column:", options=y_candidates, index=0, key='y_col')
+
+            color_col = st.selectbox("Color (optional):", options=[None] + categorical_columns, index=0)
+            agg_func = None
+            if graph_type in ['Bar']:
+                agg_func = st.selectbox("Aggregation:", options=['sum', 'mean', 'median', 'count'], index=0)
+
+            log_scale = st.checkbox("Log scale (Y)", value=False)
+            normalize = st.checkbox("Normalize (proportion) - Pie only", value=False)
+
+            st.markdown("---")
+            chart_title = st.text_input("Chart title:", value=f"{graph_type} of data")
+
+        # Build and render the figure
+        with chart_preview:
+            try:
+                fig = None
+                if graph_type == 'Scatter':
+                    fig = px.scatter(filtered_df, x=x_col, y=y_col, color=color_col, title=chart_title)
+                elif graph_type == 'Line':
+                    fig = px.line(filtered_df, x=x_col, y=y_col, color=color_col, title=chart_title)
+                elif graph_type == 'Bar':
+                    if agg_func and y_col:
+                        g = filtered_df.groupby(x_col)[y_col].agg(agg_func).reset_index()
+                        fig = px.bar(g, x=x_col, y=y_col, color=color_col, title=chart_title)
+                    else:
+                        fig = px.bar(filtered_df, x=x_col, y=y_col, color=color_col, title=chart_title)
+                elif graph_type == 'Histogram':
+                    # histogram only needs x
+                    fig = px.histogram(filtered_df, x=x_col, color=color_col, title=chart_title)
+                elif graph_type == 'Box':
+                    fig = px.box(filtered_df, x=x_col, y=y_col, color=color_col, title=chart_title)
+                elif graph_type == 'Pie':
+                    # For pie, use counts of x_col or aggregation over y_col
+                    if y_col and normalize:
+                        g = filtered_df.groupby(x_col)[y_col].sum().reset_index()
+                        fig = px.pie(g, names=x_col, values=y_col, title=chart_title)
+                    else:
+                        g = filtered_df[x_col].value_counts().reset_index()
+                        g.columns = [x_col, 'count']
+                        fig = px.pie(g, names=x_col, values='count', title=chart_title)
+                elif graph_type == 'Heatmap':
+                    # Try to create pivot table heatmap if possible
+                    if y_col and y_col in numeric_columns:
+                        pivot = filtered_df.pivot_table(index=y_col, columns=x_col, values=y_col, aggfunc='mean')
+                        fig = px.imshow(pivot, title=chart_title)
+                    else:
+                        # fallback density heatmap
+                        fig = px.density_heatmap(filtered_df, x=x_col, y=y_col if y_col else x_col, title=chart_title)
+
+                if fig is not None:
+                    if log_scale and hasattr(fig, 'update_yaxes'):
+                        fig.update_yaxes(type='log')
                     st.plotly_chart(fig, use_container_width=True)
-            
-            with chart_col2:
-                if numeric_columns:
-                    chart_col = st.selectbox("Column to visualize:", options=numeric_columns, key="chart_col")
-                    fig = px.histogram(filtered_df, x=chart_col, title=f"Distribution of {chart_col}")
-                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Unable to build chart with the selected options.")
+            except Exception as e:
+                st.error(f"Error building chart: {e}")
 
 else:
     if data_source != "Sample Data":
