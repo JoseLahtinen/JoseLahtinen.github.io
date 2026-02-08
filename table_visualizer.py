@@ -5,6 +5,8 @@ import plotly.graph_objects as go
 import requests
 import json
 from typing import Dict, List, Optional
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Page configuration
 st.set_page_config(
@@ -23,7 +25,11 @@ def fetch_stat_fin_databases() -> Dict:
     """Fetch available databases from Statistics Finland API"""
     try:
         with st.spinner("Loading Statistics Finland databases..."):
-            response = requests.get(SF_API_BASE, timeout=10)
+            # use a session with retry to handle transient 429/5xx responses
+            session = requests.Session()
+            retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+            session.mount('https://', HTTPAdapter(max_retries=retries))
+            response = session.get(SF_API_BASE, timeout=10)
             response.raise_for_status()
             return response.json()
     except Exception as e:
@@ -35,12 +41,114 @@ def fetch_stat_fin_tables(db_id: str) -> Dict:
     """Fetch available tables from a Statistics Finland database"""
     try:
         url = f"{SF_API_BASE}/{db_id}"
-        response = requests.get(url, timeout=10)
+        session = requests.Session()
+        retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+        session.mount('https://', HTTPAdapter(max_retries=retries))
+        response = session.get(url, timeout=10)
         response.raise_for_status()
         return response.json()
     except Exception as e:
         st.error(f"Error fetching tables: {e}")
         return []
+
+
+@st.cache_data(ttl=3600)
+def fetch_stat_fin_table_metadata(db_id: str, table_id: str) -> Dict:
+    """Fetch table metadata (variables and categories) from Statistics Finland"""
+    try:
+        url = f"{SF_API_BASE}/{db_id}/{table_id}"
+        session = requests.Session()
+        retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+        session.mount('https://', HTTPAdapter(max_retries=retries))
+        response = session.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        st.error(f"Error fetching table metadata: {e}")
+        return {}
+
+
+@st.cache_data(ttl=3600)
+def fetch_stat_fin_table_data_with_query(db_id: str, table_id: str, query: Dict) -> Optional[pd.DataFrame]:
+    """Fetch table data using a prepared PXWeb query dict"""
+    try:
+        with st.spinner("Loading data..."):
+            data_url = f"{SF_API_BASE}/{db_id}/{table_id}"
+            headers = {"Content-Type": "application/json"}
+            session = requests.Session()
+            retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+            session.mount('https://', HTTPAdapter(max_retries=retries))
+            data_response = session.post(
+                data_url,
+                json=query,
+                headers=headers,
+                timeout=30
+            )
+            data_response.raise_for_status()
+            data = data_response.json()
+
+            if "data" in data and "dimension" in data:
+                return parse_pxweb_data(data)
+            else:
+                st.warning("No data returned for that query")
+                return None
+    except Exception as e:
+        st.error(f"Error fetching table data: {e}")
+        return None
+
+
+def estimate_query_size(variable_selections: Dict[str, List[str]]) -> int:
+    """Estimate number of cells returned by a query (product of selection lengths)."""
+    size = 1
+    for v in variable_selections.values():
+        if not v:
+            continue
+        size *= len(v)
+    return size
+
+
+def chunked_fetch(db_id: str, table_id: str, variable_selections: Dict[str, List[str]], max_chunk_cells: int = 2000) -> Optional[pd.DataFrame]:
+    """Fetch data by splitting the largest variable into batches so each request stays under max_chunk_cells."""
+    # Determine sizes
+    sizes = {k: len(v) if v else 1 for k, v in variable_selections.items()}
+    if not sizes:
+        return fetch_stat_fin_table_data_with_query(db_id, table_id, {"response": {"format": "json"}})
+
+    # Choose split variable as the one with largest cardinality
+    split_var = max(sizes.items(), key=lambda x: x[1])[0]
+    total = estimate_query_size(variable_selections)
+
+    # compute batch size for split_var
+    other_product = max(1, total // sizes[split_var])
+    if other_product == 0:
+        other_product = 1
+    values = variable_selections[split_var]
+
+    # Determine chunk length
+    chunk_len = max(1, max_chunk_cells // other_product)
+
+    dfs = []
+    progress = st.progress(0)
+    try:
+        for i in range(0, len(values), chunk_len):
+            batch_vals = values[i:i+chunk_len]
+            q = {"response": {"format": "json"}}
+            for code, sel in variable_selections.items():
+                if code == split_var:
+                    q[code] = batch_vals
+                else:
+                    q[code] = sel
+            df_part = fetch_stat_fin_table_data_with_query(db_id, table_id, q)
+            if df_part is not None and not df_part.empty:
+                dfs.append(df_part)
+            progress.progress(min(1.0, (i+chunk_len) / len(values)))
+        progress.empty()
+        if dfs:
+            return pd.concat(dfs, ignore_index=True)
+        return None
+    except Exception as e:
+        st.error(f"Chunked fetch failed: {e}")
+        return None
 
 @st.cache_data(ttl=3600)
 def fetch_stat_fin_table_data(db_id: str, table_id: str) -> Optional[pd.DataFrame]:
@@ -104,16 +212,15 @@ def parse_pxweb_data(pxweb_response: Dict) -> pd.DataFrame:
             key_parts = item.get("key", [])
             for i, (dim_name, dim_info) in enumerate(dimensions.items()):
                 if i < len(key_parts):
-                    category_idx = int(key_parts[i])
-                    categories = dim_info.get("category", {})
-                    if "index" in categories:
-                        idx_list = categories["index"].get(str(category_idx), [])
-                        if isinstance(idx_list, list) and idx_list:
-                            row[dim_name] = idx_list[0]
-                        elif isinstance(idx_list, (int, str)):
-                            row[dim_name] = idx_list
-                    elif "label" in categories:
-                        row[dim_name] = categories["label"].get(str(category_idx), f"Category {category_idx}")
+                    key = key_parts[i]
+                    # Prefer label mapping if available, otherwise fall back to key
+                    cat = dim_info.get("category", {})
+                    labels = cat.get("label") or cat.get("labels") or {}
+                    # Labels keys may be strings or ints — try both
+                    label_val = labels.get(str(key)) if isinstance(labels, dict) else None
+                    if label_val is None:
+                        label_val = labels.get(key) if isinstance(labels, dict) else None
+                    row[dim_name] = label_val if label_val is not None else key
             
             # Add the value
             value = item.get("value")
@@ -147,7 +254,7 @@ if data_source == "Sample Data":
         'Sales': [15000, 2500, 3200, 8500, 4200, 3800],
         'Units Sold': [45, 320, 280, 65, 150, 120],
         'Rating': [4.8, 4.5, 4.3, 4.7, 4.6, 4.4],
-        'In Stock': [Yes := True, Yes, No := False, Yes, Yes, No]
+        'In Stock': [True, True, False, True, True, False]
     })
 
 elif data_source == "Upload CSV":
@@ -217,9 +324,83 @@ elif data_source == "Statistics Finland":
                     if selected_table_name:
                         selected_table_id = table_dict[selected_table_name]
                         
-                        # Load the data
+                        # Fetch metadata for the selected table to build selectors
+                        metadata = fetch_stat_fin_table_metadata(selected_db_id, selected_table_id)
+                        variable_selections = {}
+
+                        select_all_opt = st.checkbox("Select all categories for each variable (may return large datasets)", value=False)
+
+                        if metadata and metadata.get("variables"):
+                            st.markdown("**Choose variable selections**")
+                            for var in metadata["variables"]:
+                                code = var.get("code")
+                                name = var.get("text") or code
+                                # Try common keys for category values
+                                options = []
+                                if var.get("values"):
+                                    options = var.get("values")
+                                elif var.get("valueTexts") and isinstance(var.get("valueTexts"), dict):
+                                    options = list(var.get("valueTexts").keys())
+                                elif var.get("valueTexts") and isinstance(var.get("valueTexts"), list):
+                                    options = var.get("valueTexts")
+                                elif var.get("values") is None and var.get("valueTexts") is None:
+                                    # Fallback: try categories from metadata dimension
+                                    dim = metadata.get("dimension", {}).get(code, {})
+                                    cat = dim.get("category", {})
+                                    labels = cat.get("label") or cat.get("labels") or {}
+                                    if isinstance(labels, dict):
+                                        options = list(labels.keys())
+
+                                # Ensure options is a list of strings
+                                options = [str(o) for o in (options or [])]
+                                if not options:
+                                    # If no options, skip this variable
+                                    continue
+
+                                default = options if select_all_opt else [options[0]]
+                                sel = st.multiselect(f"{name} ({code})", options=options, default=default, key=f"var_{code}")
+                                variable_selections[code] = sel
+
+                        # Now provide preview and size/ chunking controls
+                        estimated_cells = estimate_query_size(variable_selections)
+                        st.write(f"Estimated result size: **{estimated_cells}** cells")
+                        large_threshold = 5000
+                        if estimated_cells > large_threshold:
+                            st.warning("This query is large and may take a long time or be rate-limited. Consider loading a preview or using chunked loading.")
+
+                        # Chunked loading options
+                        chunk_opts = st.expander("Chunked loading options (advanced)")
+                        with chunk_opts:
+                            max_chunk_cells = st.number_input("Max cells per request (chunk size):", min_value=500, max_value=20000, value=2000, step=500)
+                            enable_chunked = st.checkbox("Enable chunked loading for large queries", value=True)
+
+                        # Preview button: fetch a tiny preview using first value of each variable
+                        if st.button("Load Preview (small)", key="load_preview"):
+                            preview_query = {"response": {"format": "json"}}
+                            for code, vals in variable_selections.items():
+                                if vals:
+                                    preview_query[code] = [vals[0]]
+                            preview_df = fetch_stat_fin_table_data_with_query(selected_db_id, selected_table_id, preview_query)
+                            if preview_df is not None:
+                                st.dataframe(preview_df.head(100))
+
+                        # Build and run the full query when requested
                         if st.button("Load Data", key="load_sf_data"):
-                            df = fetch_stat_fin_table_data(selected_db_id, selected_table_id)
+                            query: Dict = {"response": {"format": "json"}}
+                            for code, selected_vals in variable_selections.items():
+                                if selected_vals:
+                                    query[code] = selected_vals
+
+                            if not variable_selections:
+                                st.info("No variable selections available for this table. Attempting to load default data.")
+                                df = fetch_stat_fin_table_data_with_query(selected_db_id, selected_table_id, {"response": {"format": "json"}})
+                            else:
+                                # If estimated size is big and chunked loading enabled, use chunked_fetch
+                                if estimated_cells > large_threshold and enable_chunked:
+                                    st.info("Loading data in chunks...")
+                                    df = chunked_fetch(selected_db_id, selected_table_id, variable_selections, max_chunk_cells=int(max_chunk_cells))
+                                else:
+                                    df = fetch_stat_fin_table_data_with_query(selected_db_id, selected_table_id, query)
                 else:
                     st.info("No tables available in this database")
             else:
